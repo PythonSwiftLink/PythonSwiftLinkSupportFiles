@@ -2,6 +2,7 @@ import ast
 from ast import *
 from os import remove
 from pickle import FALSE
+from tkinter.messagebox import NO
 
 import astor
 import json
@@ -10,7 +11,7 @@ import platform
 from typing import List
 from pathlib import Path
 from cython import struct
-
+from pprint import pprint
 
 
 PRINTTAB = "\t"
@@ -136,14 +137,10 @@ def add_enums(module: ast.Module, extra: str):
 
 def handleGlobalAssigns(module:ast.Module, body: ast.Assign):
     value = body.value
-    #print("handleGlobalAssigns:")
     if isinstance(value, ast.Call):
         func = value.func
         id = func.id
-        #print(f"\tid: {func.id} {func}")
-        #print(f"\tfunc: {value.func}")
-        #print(f"\targs: {value.args}")
-        #print(f"\tkeywords: {value.keywords}")
+
         if id == "Enum":
             module.body.remove(body)
 def get_class_decorators(body_list: list[ast.stmt]) -> list[str]:
@@ -189,9 +186,19 @@ def extract_python_classes(string: str) -> str:
                 continue
             if "wrapper" in deco_list:
                 remove_class_decorator(module,i,class_body.decorator_list,"wrapper")
+
+            if "swift_object" in deco_list:
+                remove_class_decorator(module,i,class_body.decorator_list,"swift_object")
                 #continue
             
             excluded_classes.append(class_body)
+
+        if isinstance(class_body, ast.FunctionDef):
+            deco_list = get_class_decorators(class_body.decorator_list)
+            if "swift_object" in deco_list:
+                #remove_class_decorator(module,i,class_body.decorator_list,"swift_object")
+                continue
+
     
     for imp in body_list:
         if isinstance(imp, ast.ImportFrom):
@@ -199,14 +206,28 @@ def extract_python_classes(string: str) -> str:
                 body_list.remove(imp)
     excluded_assigns = []
     for assign in body_list:
-        if isinstance(assign, ast.Assign):
-            if isinstance(assign.value, ast.Call):
-                if assign.value.func.id == "Enum":
-                    excluded_assigns.append(assign)
-                    #body_list.remove(assign)
-                elif assign.value.func.id == "ObjectStrEnum":
-                    excluded_assigns.append(assign)
-                    #body_list.remove(assign)
+        match assign:
+            case ast.Assign():
+                match assign.value:
+                    case ast.Call():
+                        match assign.value.func.id:
+                            case "Enum":
+                                excluded_assigns.append(assign)
+                            case "ObjectStrEnum":
+                                excluded_assigns.append(assign)
+            case ast.FunctionDef():
+                deco_list = get_class_decorators(class_body.decorator_list)
+                if "swift_func" in deco_list:
+                    excluded_classes.append(assign)
+        # if isinstance(assign, ast.Assign):
+        #     if isinstance(assign.value, ast.Call):
+        #         if assign.value.func.id == "Enum":
+        #             excluded_assigns.append(assign)
+        #             #body_list.remove(assign)
+        #         elif assign.value.func.id == "ObjectStrEnum":
+        #             excluded_assigns.append(assign)
+        #             #body_list.remove(assign)
+            
     for ann in excluded_assigns:
         module.body.remove(ann)
     for cls in excluded_classes:
@@ -218,7 +239,6 @@ def extract_python_classes(string: str) -> str:
 
 def handle_arg_arg(arg: ast.arg, options: list[str]) -> str:
     anno = arg.annotation
-    #print(PRINTTAB, type(arg.annotation))
     match anno:
         case ast.Name():
             return anno.id
@@ -257,7 +277,6 @@ def handleSubscript(arg: ast.Subscript, options: list[str]) -> str:
         return sub_id
 
 def handle_AnnAssign(arg: ast.AnnAssign, options: list[str]) -> str:
-    #print("\thandle_AnnAssign",arg.__dict__)
     return arg.annotation.id
 
 
@@ -273,7 +292,6 @@ def handle_arg_type(arg, count: int, returns: bool) -> dict:
         case ast.AnnAssign():
             t = handle_AnnAssign(arg,options)
         case ast.Subscript():
-            print("ast.Subscript")
             t = handleSubscript(arg, options)
         case ast.Slice():
             print("ast.Slice")
@@ -282,7 +300,6 @@ def handle_arg_type(arg, count: int, returns: bool) -> dict:
             
             
     # if isinstance(arg, ast.arg):
-    #     #print("ast.arg")
     #     t = handle_arg_arg(arg, options)
     # elif isinstance(arg, ast.AnnAssign):
     #     #print("ast.AnnAssign")
@@ -347,7 +364,6 @@ def handle_arg_type(arg, count: int, returns: bool) -> dict:
         options.append("data")
     
     if returns:
-        print("return",t)
         return {
         "name": t,
         "type": t,
@@ -376,13 +392,18 @@ class PyWrapClass:
     types: list[str]
     properties: list[dict]
     singleton: bool
+    swift_object_mode: bool
     functions: list[dict]
+    init_function: dict
     
-    def __init__(self, pyi_mode: bool = False):
+    def __init__(self, swift_object_mode: bool = False):
         self.properties = []
-        self.pyi_mode = pyi_mode
+        self.pyi_mode = False
+        
         self.singleton = True
         self.functions = []
+        self.swift_object_mode = swift_object_mode
+        self.init_function = None
     
 
     def parse_code_json(self,class_body):
@@ -401,6 +422,9 @@ class PyWrapClass:
         self.handle_class_children(class_body.body)
     
         self.export_dict["singleton"] = self.singleton
+        self.export_dict["swift_object_mode"] = self.swift_object_mode
+        if self.init_function:
+            self.export_dict["init_function"] = {**self.init_function}
         return self.export_dict
 
     def handle_class_decorators(self,class_body: ast.ClassDef):
@@ -459,6 +483,38 @@ class PyWrapClass:
                                         svalue = word.value
                                         #if isinstance(svalue, ast.Constant):
                                         self.singleton = svalue.value
+                case "swift_object":
+                    match dec:
+                        case ast.Call():
+                            keywords: list[ast.keyword] = dec.keywords
+                            keywords_str = [word.arg for word in keywords]
+                            dispatch_events = []
+                            for word in keywords:
+                                key = word.arg
+                                word_value = word.value
+                                
+                                match key:
+                                    case "dispatch_events":
+                                        events = get_key("events", keywords)
+                                        if events:
+                                            _events_ = [event.value for event in events.value.elts]
+                                            d = {
+                                                "type": "EventDispatch",
+                                                "args": [json.dumps({
+                                                    "events": _events_
+                                                })]
+                                            }
+                                            self.export_dict["decorators"].append(d)
+                                    case "sequences_as_object": ...
+                                    case "str_as_object": ...
+                                    
+                                    # case "singleton":
+                                    #     svalue = word.value
+                                    #     #if isinstance(svalue, ast.Constant):
+                                    #     self.singleton = svalue.value
+
+                    
+
                         
                 
             # if id == "EventDispatcher":
@@ -522,8 +578,6 @@ class PyWrapClass:
                     name = cbody.name
                     match name:
                         case "Callbacks":
-                            print("ast.ClassDef")
-                            print(cbody.__dict__)
                             for fbody in cbody.body:
                                 if isinstance(fbody, ast.FunctionDef):
                                     self.handle_callbacks(fbody)
@@ -664,35 +718,37 @@ class PyWrapClass:
             #"swift_func": False,
         }
         self.handle_function_decorators(body,func)
-        
-        functions.append(func)
+        if body.name == "__init__":
+            self.init_function = func
+        else:
+            functions.append(func)
         count = 0
         func_options = func["options"]
-        if not singleton:
-            if "callback" in func_options:
-                arg_list.append(
-                    {
-                        "name": "cls",
-                        "type": "CythonClass",
-                        # "is_list": is_list,
-                        # "is_data": is_data,
-                        "options": [],
-                        "idx": count
-                    }
-                )
-                count += 1
-        if "send_self" in func_options:
-            arg_list.append(
-                    {
-                        "name": "cls",
-                        "type": "CythonClass",
-                        # "is_list": is_list,
-                        # "is_data": is_data,
-                        "options": [],
-                        "idx": count
-                    }
-                )
-            count += 1
+        # if not singleton:
+        #     if "callback" in func_options:
+        #         arg_list.append(
+        #             {
+        #                 "name": "cls",
+        #                 "type": "CythonClass",
+        #                 # "is_list": is_list,
+        #                 # "is_data": is_data,
+        #                 "options": [],
+        #                 "idx": count
+        #             }
+        #         )
+        #         count += 1
+        # if "send_self" in func_options:
+            # arg_list.append(
+            #         {
+            #             "name": "cls",
+            #             "type": "CythonClass",
+            #             # "is_list": is_list,
+            #             # "is_data": is_data,
+            #             "options": [],
+            #             "idx": count
+            #         }
+            #     )
+            # count += 1
         # if (not singleton and "callback" in func["options"]) or "send_self" in func["options"]:
         #     arg_list.append(
         #         {
@@ -706,11 +762,9 @@ class PyWrapClass:
         #     )
         #     count += 1
         for arg in func_args:
-            #print("\t",arg.arg, arg.annotation.id)
             if arg.arg == "self":
                 continue
             arg_data = handle_arg_type(arg,count,False)
-            #print("\t",arg_data)
             arg_list.append(arg_data)
             count += 1
 
@@ -719,6 +773,7 @@ class PyWrapModule:
     filename: str
     pyi_mode: bool
     classes: list[dict]
+    functions: list[dict]
     custom_structs: list[dict]
     custom_enums: list[dict]
     python_classes: list[str]
@@ -736,6 +791,8 @@ class PyWrapModule:
         custom_structs = []
         self.custom_enums = []
         type_var_list = []
+
+        self.functions = []
         
         self.handleCustomEnums(module.body)
         
@@ -751,6 +808,12 @@ class PyWrapModule:
                         wrap_class = PyWrapClass()
                         js = wrap_class.parse_code_json(body)
                         self.classes.append(js)
+                    elif "swift_object" in deco_list or self.pyi_mode:
+                        wrap_class = PyWrapClass(True)
+                        js = wrap_class.parse_code_json(body)
+                        self.classes.append(js)
+                case ast.FunctionDef():
+                    self.handle_module_function(body)
         py_src = extract_python_classes(string)
         
         self.python_classes.append(py_src)                   
@@ -785,7 +848,6 @@ class PyWrapModule:
                                         "keys": enum_keys
                                     })
                                 case "ObjectStrEnum":
-                                    print("\n\n\n\nObjectEnum Found\n\n\n\n")
                                     enum_keys = []
                                     for i, key in enumerate(body.value.args):
                                         if isinstance(key, ast.Constant):
@@ -798,6 +860,7 @@ class PyWrapModule:
                                         "title": body.targets[0].id,
                                         "keys": enum_keys
                                     })
+                        
 
     
     
@@ -816,4 +879,71 @@ class PyWrapModule:
         
         self.custom_structs.append(d)
         
+
+    def handle_module_function(self, body: ast.FunctionDef):
+        func_args = body.args.args
+        functions: list = self.functions
+        arg_list = []
+        returns = body.returns
         
+
+        if returns:
+            _return_ = handle_arg_type(returns, 0, True)
+        else:
+            _return_ = {
+            "name": "void",
+            "type": "void",
+            "idx": 0,
+            "is_return": True
+        }
+        func = {
+            "name": body.name,
+            "args": arg_list,
+            "returns": _return_,
+        }
+        self.handle_function_decorators(body,func)
+        func_options = func["options"]
+        if "python" in func_options:
+            return
+        functions.append(func)
+        count = 0
+        
+        
+
+        for arg in func_args:
+            if arg.arg == "self":
+                continue
+            arg_data = handle_arg_type(arg,count,False)
+            arg_list.append(arg_data)
+            count += 1
+
+    def handle_function_decorators(self, body: FunctionDef, func_dict: dict) -> List[str]:
+        dec_list = []
+        options = []
+        for decorator in body.decorator_list:
+            
+            if isinstance(decorator,ast.Call):
+                t = decorator.func.id
+                # if t == "callback":
+                #     self.handle_callback_decorator(decorator, func_dict, options)
+                    
+            else:
+                t = decorator.id
+            match t:
+                case "python":
+                    options.append("python")
+                case "swift_func":
+                    options.append("swift_func")
+                case "call_target":
+                    func_dict["call_target"] = decorator.args[0].value
+                case "call_class":
+                    func_dict["call_class"] = decorator.args[0].value
+                case "call_object":
+                    func_dict["call_object"] = decorator.args[0].value
+                case "direct":
+                    options.append("direct")
+        if "options" in func_dict:
+            func_dict["options"].extend(options)
+            return
+        
+        func_dict["options"] = options
