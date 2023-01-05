@@ -61,6 +61,8 @@ fileprivate func export_orientation() {
 func main(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32 {
     
     var ret: Int32 = 0
+    
+    chdir("YourApp")
     //let _ = PythonMain.shared
     putenv("PYTHONOPTIMIZE=2")
     putenv("PYTHONDONTWRITEBYTECODE=1")
