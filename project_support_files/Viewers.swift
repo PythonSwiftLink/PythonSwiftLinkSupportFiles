@@ -12,23 +12,6 @@ import PDFKit
 import MobileCoreServices
 
 
-class WebViewer: UIViewController,WKNavigationDelegate {
-    var webview: WKWebView!
-    
-    override func loadView() {
-        webview = WKWebView()
-        webview.navigationDelegate = self
-        view = webview
-    }
-    
-    func loadURL(path: String) {
-        
-        let url = URL(string: path)!
-        print(url)
-        webview.load(URLRequest(url: url))
-    }
-}
-
 
 class PDF_Viewer: UIViewController {
     
